@@ -12,16 +12,19 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// Config loaded from Environment Variables
 var (
-	AgentSecret = os.Getenv("AGENT_SECRET")     // To verify requests from Next.js
-	NextJsURL   = os.Getenv("NEXTJS_URL")       // e.g., http://192.168.8.146:3000
-	NextJsKey   = os.Getenv("NEXTJS_API_KEY")   // To authenticate back to Next.js
-	ConfigDir   = os.Getenv("NIXOS_CONFIG_DIR") // e.g., /home/vdi/vdi_nixos_config
-	Hostname, _ = os.Hostname()                 // To identify this VM
+	AgentSecret = os.Getenv("AGENT_SECRET")
+	NextJsKey   = os.Getenv("NEXTJS_API_KEY")
+	ConfigDir   = os.Getenv("NIXOS_CONFIG_DIR")
+	Hostname, _ = os.Hostname()
 )
 
-// Payload sent to Next.js
+// Request coming FROM Next.js
+type SyncRequest struct {
+	CallbackURL string `json:"callbackUrl" binding:"required"`
+}
+
+// Payload going TO Next.js
 type LogPayload struct {
 	Type       string `json:"type"`
 	Severity   string `json:"severity"`
@@ -31,13 +34,8 @@ type LogPayload struct {
 }
 
 func main() {
-	if AgentSecret == "" || NextJsURL == "" || ConfigDir == "" {
-		log.Fatal("Missing required environment variables")
-	}
-
 	r := gin.Default()
 
-	// Middleware to verify requests from Next.js
 	r.Use(func(c *gin.Context) {
 		token := c.GetHeader("Authorization")
 		if token != "Bearer "+AgentSecret {
@@ -54,15 +52,21 @@ func main() {
 }
 
 func handleSync(c *gin.Context) {
-	// Acknowledge the request immediately so Next.js doesn't timeout
-	c.JSON(http.StatusAccepted, gin.H{"status": "Sync initiated in background"})
+	var req SyncRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing callbackUrl"})
+		return
+	}
 
-	// Run the heavy lifting asynchronously
-	go performSync()
+	// Acknowledge the request immediately
+	c.JSON(http.StatusAccepted, gin.H{"status": "Sync initiated"})
+
+	// Pass the dynamically provided URL to the background worker
+	go performSync(req.CallbackURL)
 }
 
-func performSync() {
-	sendLog("NIX_SYNC_REQUESTED", "INFO", "Started git pull and NixOS rebuild")
+func performSync(callbackURL string) {
+	sendLog(callbackURL, "NIX_SYNC_REQUESTED", "INFO", "Started git pull and NixOS rebuild")
 
 	// 1. Git Pull --Rebase
 	pullCmd := exec.Command("git", "pull", "--rebase")
@@ -70,30 +74,32 @@ func performSync() {
 	pullOut, err := pullCmd.CombinedOutput()
 	if err != nil {
 		sendLog(
+			callbackURL,
 			"NIX_BUILD_FAILED",
 			"ERROR",
-			fmt.Sprintf("Git pull failed: %s", err.Error()),
+			fmt.Sprintf("Git pull failed: %v", err),
 			string(pullOut),
 		)
 		return
 	}
 
 	// 2. NixOS Rebuild Switch
-	// Note: We use sudo here. The agent must have passwordless sudo for nixos-rebuild
 	rebuildCmd := exec.Command("sudo", "nixos-rebuild", "switch", "--flake", ".#vdi")
 	rebuildCmd.Dir = ConfigDir
 	rebuildOut, err := rebuildCmd.CombinedOutput()
 	if err != nil {
 		sendLog(
+			callbackURL,
 			"NIX_BUILD_FAILED",
 			"ERROR",
-			fmt.Sprintf("NixOS rebuild failed: %s", err.Error()),
+			fmt.Sprintf("NixOS rebuild failed: %v", err),
 			string(rebuildOut),
 		)
 		return
 	}
 
 	sendLog(
+		callbackURL,
 		"NIX_BUILD_SUCCESS",
 		"INFO",
 		"Successfully pulled and rebuilt NixOS",
@@ -101,7 +107,7 @@ func performSync() {
 	)
 }
 
-func sendLog(logType, severity, message string, details ...string) {
+func sendLog(callbackURL, logType, severity, message string, details ...string) {
 	detailStr := ""
 	if len(details) > 0 {
 		detailStr = details[0]
@@ -111,20 +117,16 @@ func sendLog(logType, severity, message string, details ...string) {
 		Type:       logType,
 		Severity:   severity,
 		Message:    message,
-		TargetName: Hostname, // Send the hostname so Next.js knows which VM this is
+		TargetName: Hostname,
 		Details:    detailStr,
 	}
 
 	jsonData, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", NextJsURL+"/api/agent/log", bytes.NewBuffer(jsonData))
+	// Use the callbackURL provided by Next.js!
+	req, _ := http.NewRequest("POST", callbackURL, bytes.NewBuffer(jsonData))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+NextJsKey)
 
 	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Failed to send log to Next.js: %v", err)
-		return
-	}
-	defer resp.Body.Close()
+	client.Do(req) // Fire and forget
 }
