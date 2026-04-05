@@ -84,7 +84,14 @@ func performSync(callbackURL string) {
 	}
 
 	// 2. NixOS Rebuild Switch
-	rebuildCmd := exec.Command("sudo", "nixos-rebuild", "switch", "--flake", ".#vdi")
+	// rebuildCmd := exec.Command("sudo", "nixos-rebuild", "switch", "--flake", ".#vdi")
+	rebuildCmd := exec.Command(
+		"/run/wrappers/bin/sudo",
+		"/run/current-system/sw/bin/nixos-rebuild",
+		"switch",
+		"--flake",
+		".#vdi",
+	)
 	rebuildCmd.Dir = ConfigDir
 	rebuildOut, err := rebuildCmd.CombinedOutput()
 	if err != nil {

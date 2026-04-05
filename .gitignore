@@ -1,3 +1,4 @@
 .env
 .env.local
 vdi-agent.env
+vdi-agent
