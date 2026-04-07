@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -19,33 +18,30 @@ var (
 	ConfigDir   = os.Getenv("NIXOS_CONFIG_DIR")
 )
 
-// SyncRequest is the JSON sent FROM Next.js to this agent
 type SyncRequest struct {
 	CallbackURL string `json:"callbackUrl" binding:"required"`
 	VMID        string `json:"vmId"        binding:"required"`
 }
 
-// LogPayload is the JSON sent BACK to the Next.js Webhook
-// Standardized to 'targetId' to match the Prisma Log model and your Webhook API
 type LogPayload struct {
 	Type       string `json:"type"`
 	Severity   string `json:"severity"`
 	Message    string `json:"message"`
 	TargetName string `json:"targetName"`
-	TargetID   string `json:"targetId"` // Standardized field name
+	TargetId   string `json:"targetId"` // For the Log table
+	VmId       string `json:"vmId"`     // For the Status update logic
 	Details    string `json:"details,omitempty"`
 }
 
 func main() {
 	if AgentSecret == "" || NextJsKey == "" || ConfigDir == "" {
 		log.Fatal(
-			"Missing required environment variables: AGENT_SECRET, NEXTJS_API_KEY, or NIXOS_CONFIG_DIR",
+			"Missing environment variables: AGENT_SECRET, NEXTJS_API_KEY, or NIXOS_CONFIG_DIR",
 		)
 	}
 
 	r := gin.Default()
 
-	// Middleware to verify requests
 	r.Use(func(c *gin.Context) {
 		token := c.GetHeader("Authorization")
 		if token != "Bearer "+AgentSecret {
@@ -57,16 +53,14 @@ func main() {
 
 	r.POST("/api/sync", handleSync)
 
-	currentHostname, _ := os.Hostname()
-	log.Printf("Starting VDI Agent on port 8081 for host %s", currentHostname)
+	host, _ := os.Hostname()
+	log.Printf("Starting VDI Agent on :8081 for host %s", host)
 
-	// Create a server with a timeout to prevent hanging connections
 	s := &http.Server{
-		Addr:           "0.0.0.0:8081",
-		Handler:        r,
-		ReadTimeout:    10 * time.Second,
-		WriteTimeout:   10 * time.Second,
-		MaxHeaderBytes: 1 << 20,
+		Addr:         "0.0.0.0:8081",
+		Handler:      r,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 	s.ListenAndServe()
 }
@@ -74,38 +68,31 @@ func main() {
 func handleSync(c *gin.Context) {
 	var req SyncRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required fields (callbackUrl, vmId)"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing vmId or callbackUrl"})
 		return
 	}
 
-	// Acknowledge the request immediately so Next.js can move on
 	c.JSON(http.StatusAccepted, gin.H{"status": "Sync initiated"})
-
-	// Run the heavy lifting in a background goroutine
+	// Execute the sync in a background thread
 	go performSync(req.CallbackURL, req.VMID)
 }
 
 func performSync(callbackURL string, vmId string) {
-	sendLog(callbackURL, vmId, "NIX_SYNC_REQUESTED", "INFO", "Started NixOS rebuild")
+	// 1. Initial log: Sync Requested
+	sendLog(callbackURL, vmId, "NIX_SYNC_REQUESTED", "INFO", "Started NixOS configuration sync")
 
-	// 1. Git Pull --Rebase
+	// 2. Git Pull
+	log.Printf("[%s] Pulling latest changes...", vmId)
 	pullCmd := exec.Command("git", "pull", "--rebase")
 	pullCmd.Dir = ConfigDir
 	pullOut, err := pullCmd.CombinedOutput()
 	if err != nil {
-		sendLog(
-			callbackURL,
-			vmId,
-			"NIX_BUILD_FAILED",
-			"ERROR",
-			fmt.Sprintf("Git pull failed: %v", err),
-			string(pullOut),
-		)
+		sendLog(callbackURL, vmId, "NIX_BUILD_FAILED", "ERROR", "Git pull failed", string(pullOut))
 		return
 	}
 
-	// 2. NixOS Rebuild Switch
-	// We use absolute paths for sudo and nixos-rebuild to ensure zero path ambiguity
+	// 3. NixOS Rebuild
+	log.Printf("[%s] Running nixos-rebuild...", vmId)
 	rebuildCmd := exec.Command(
 		"/run/wrappers/bin/sudo",
 		"/run/current-system/sw/bin/nixos-rebuild",
@@ -117,17 +104,20 @@ func performSync(callbackURL string, vmId string) {
 	rebuildOut, err := rebuildCmd.CombinedOutput()
 
 	if err != nil {
+		log.Printf("[%s] Rebuild failed!", vmId)
 		sendLog(
 			callbackURL,
 			vmId,
 			"NIX_BUILD_FAILED",
 			"ERROR",
-			"NixOS rebuild failed",
+			"NixOS rebuild execution failed",
 			string(rebuildOut),
 		)
 		return
 	}
 
+	// 4. Success Log
+	log.Printf("[%s] Rebuild successful!", vmId)
 	sendLog(
 		callbackURL,
 		vmId,
@@ -144,35 +134,29 @@ func sendLog(callbackURL, vmId, logType, severity, message string, details ...st
 		detailStr = details[0]
 	}
 
-	// Fetch hostname fresh every time a log is sent.
-	currentHostname, _ := os.Hostname()
-
+	host, _ := os.Hostname()
 	payload := LogPayload{
 		Type:       logType,
 		Severity:   severity,
 		Message:    message,
-		TargetName: currentHostname,
-		TargetID:   vmId,
+		TargetName: host,
+		TargetId:   vmId, // Sends as targetId
+		VmId:       vmId, // Sends as vmId (Duplicate for safety)
 		Details:    detailStr,
 	}
 
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		log.Printf("Error encoding JSON: %v", err)
-		return
-	}
-
+	jsonData, _ := json.Marshal(payload)
 	req, err := http.NewRequest("POST", callbackURL, bytes.NewBuffer(jsonData))
 	if err != nil {
-		log.Printf("Error creating callback request: %v", err)
+		log.Printf("Error creating request: %v", err)
 		return
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+NextJsKey)
 
-	// Set a reasonable timeout for the callback
-	client := &http.Client{Timeout: 10 * time.Second}
+	// INCREASED TIMEOUT: To prevent 'context deadline exceeded'
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 
 	if err != nil {
@@ -182,6 +166,6 @@ func sendLog(callbackURL, vmId, logType, severity, message string, details ...st
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		log.Printf("Webhook returned error status: %d", resp.StatusCode)
+		log.Printf("Webhook error status %d for VM %s", resp.StatusCode, vmId)
 	}
 }
